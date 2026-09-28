@@ -5,8 +5,16 @@
 # 入れるもの : torch 2.5.1 / pipパッケージ一式 / ビルド済み vis4d_cuda_ops(CUDA版)/ WildDet3D / JupyterLab
 # 入れないもの: モデルの重み(SAM3・WildDet3D等)、Hugging Faceトークン、入力・出力ファイル
 #              → 重みは /workspace(Persistent storage)に保存し、トークンは実行時に入力する
+#
+# 4つの段階(pkgs → ops → wd3d → final)に分けてある。GitHub Actionsでは段階ごとにキャッシュを保存するため、
+# 失敗しても、成功済みの段階は再利用され、失敗した段階からやり直せる。
+# 通常の `docker build .` は、最後の段階(final)まで作る。
 # =====================================================================
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+
+# ---------------------------------------------------------------------
+# 段階1: pkgs — OSパッケージ、pipパッケージ(ノートブック Section 1〜1.5)
+# ---------------------------------------------------------------------
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel AS pkgs
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -24,18 +32,31 @@ RUN apt-get update \
 
 RUN pip install --upgrade pip wheel ninja "setuptools<80"
 
-# ---- ノートブック Section 1 と同じ順序でインストール(依存関係の解決結果をそろえるため) ----
-RUN pip install huggingface_hub objaverse open_clip_torch
-RUN pip install trimesh pyfqmr matplotlib scipy networkx shapely
-RUN pip install "transformers==5.15.1" accelerate timm
-RUN pip install -U safetensors
+# torch 系は、ベースイメージの版(2.5.1 / CUDA 12.4)に固定する。他のパッケージがtorchを入れ替えようとした場合、
+# 黙って入れ替わらず、依存関係の衝突エラーとして、原因のパッケージがすぐ分かるようにする。
+RUN printf 'torch==2.5.1\ntorchvision==0.20.1\ntorchaudio==2.5.1\n' > /opt/pip-constraints.txt
 
-# ---- Section 1.5: MoGe-2 ----
-RUN pip install opencv-python-headless
-RUN pip install "git+https://github.com/microsoft/MoGe.git"
+# ノートブック Section 1 と同じ順序でインストール(依存関係の解決結果をそろえるため)
+RUN pip install -c /opt/pip-constraints.txt huggingface_hub objaverse open_clip_torch
+RUN pip install -c /opt/pip-constraints.txt trimesh pyfqmr matplotlib scipy networkx shapely
+RUN pip install -c /opt/pip-constraints.txt "transformers==5.15.1" accelerate timm
+RUN pip install -c /opt/pip-constraints.txt -U safetensors
 
-# ---- Section 7.5: vis4d / vis4d_cuda_ops / WildDet3D ----
-RUN pip install vis4d==1.0.0
+# Section 1.5: MoGe-2
+RUN pip install -c /opt/pip-constraints.txt opencv-python-headless
+# MoGe は、2026-08-19 に main が MoGe-3 に切り替わった(依存関係が大きく変わり、torchも入れ替わる)。
+# ノートブックが使う MoGe-2(moge.model.v2)の最後のコミットに固定する。
+RUN pip install -c /opt/pip-constraints.txt "git+https://github.com/microsoft/MoGe.git@925b8ed835a7a9cdb7578ba15c658a0afc969030"
+
+# 段階1の確認: torch が入れ替わっていないか
+RUN python -c "import torch; assert torch.__version__.startswith('2.5.1') and torch.version.cuda == '12.4', (torch.__version__, torch.version.cuda); print('torch OK:', torch.__version__, 'CUDA', torch.version.cuda)"
+
+# ---------------------------------------------------------------------
+# 段階2: ops — vis4d と CUDA拡張 vis4d_cuda_ops(いちばん時間がかかる)
+# ---------------------------------------------------------------------
+FROM pkgs AS ops
+
+RUN pip install -c /opt/pip-constraints.txt vis4d==1.0.0
 
 # vis4d_cuda_ops の setup.py は「ビルド時にGPUが見えないとCPU専用版を作る」ため、
 # Dockerのビルド環境(GPUなし)でもCUDA版を作れるよう、その判定だけを外す。
@@ -44,7 +65,7 @@ RUN git clone --depth 1 https://github.com/SysCV/vis4d_cuda_ops.git /tmp/vis4d_c
  && cd /tmp/vis4d_cuda_ops \
  && sed -i 's/if torch.cuda.is_available() and CUDA_HOME is not None:/if CUDA_HOME is not None:/' setup.py \
  && grep -q 'if CUDA_HOME is not None:' setup.py \
- && pip install . --no-build-isolation \
+ && pip install -c /opt/pip-constraints.txt . --no-build-isolation \
  && cd / && rm -rf /tmp/vis4d_cuda_ops
 
 # CUDA版としてビルドされているか検証する(CPU専用版ならここでビルドを失敗させる)
@@ -60,14 +81,31 @@ if not archs:
     sys.exit("vis4d_cuda_ops がCUDA版になっていません(CPU専用版)。")
 PYEOF
 
+# 段階2の確認: torch が入れ替わっていないか
+RUN python -c "import torch; assert torch.__version__.startswith('2.5.1') and torch.version.cuda == '12.4', (torch.__version__, torch.version.cuda); print('torch OK:', torch.__version__, 'CUDA', torch.version.cuda)"
+
+# ---------------------------------------------------------------------
+# 段階3: wd3d — WildDet3D 本体と、以降のセクションで使うパッケージ
+# ---------------------------------------------------------------------
+FROM ops AS wd3d
+
 RUN git clone --recurse-submodules https://github.com/allenai/WildDet3D.git ${WILDDET3D_DIR}
-RUN pip install -r ${WILDDET3D_DIR}/requirements.txt
+RUN pip install -c /opt/pip-constraints.txt -r ${WILDDET3D_DIR}/requirements.txt
 
-# ---- 以降のセクションで使うパッケージ(plotly / CoACD / rtree / python-fcl)と、JupyterLab ----
-RUN pip install plotly coacd rtree python-fcl
-RUN pip install jupyterlab ipywidgets
+# plotly(Section 7.6)/ CoACD(Section 13)/ rtree・python-fcl(Section 13.5 以降)
+RUN pip install -c /opt/pip-constraints.txt plotly coacd rtree python-fcl
 
-# ---- 最終確認: torch が 2.5.1 のままか(他パッケージに入れ替えられていないか) ----
+# 段階3の確認: torch が入れ替わっていないか
+RUN python -c "import torch; assert torch.__version__.startswith('2.5.1') and torch.version.cuda == '12.4', (torch.__version__, torch.version.cuda); print('torch OK:', torch.__version__, 'CUDA', torch.version.cuda)"
+
+# ---------------------------------------------------------------------
+# 段階4: final — JupyterLab、最終確認、起動スクリプト
+# ---------------------------------------------------------------------
+FROM wd3d AS final
+
+RUN pip install -c /opt/pip-constraints.txt jupyterlab ipywidgets
+
+# 最終確認: torch が 2.5.1 のままか(他パッケージに入れ替えられていないか)
 RUN python - <<'PYEOF'
 import torch, transformers, trimesh, scipy, fcl, rtree, coacd, open_clip, objaverse, moge, vis4d_cuda_ops
 print("torch", torch.__version__, "| CUDA", torch.version.cuda, "| transformers", transformers.__version__)
