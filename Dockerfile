@@ -71,6 +71,7 @@ RUN git clone --depth 1 https://github.com/SysCV/vis4d_cuda_ops.git /tmp/vis4d_c
 # CUDA版としてビルドされているか検証する(CPU専用版ならここでビルドを失敗させる)
 RUN python - <<'PYEOF'
 import re, subprocess, sys
+import torch  # 先に import する(拡張モジュールが必要とする libc10.so を、torch が読み込む)
 import vis4d_cuda_ops
 so = vis4d_cuda_ops.__file__
 out = subprocess.run(["/usr/local/cuda/bin/cuobjdump", "--list-elf", so], capture_output=True, text=True).stdout
